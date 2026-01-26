@@ -1,77 +1,118 @@
-var express = require('express'),
-    async = require('async'),
-    { Pool } = require('pg'),
-    cookieParser = require('cookie-parser'),
-    app = express(),
-    server = require('http').Server(app),
-    io = require('socket.io')(server);
+const express = require('express');
+const { Pool } = require('pg');
+const cookieParser = require('cookie-parser');
+const http = require('http');
+const socketIO = require('socket.io');
+const path = require('path');
 
-var port = process.env.PORT || 4000;
+const app = express();
+const server = http.Server(app);
+const io = socketIO(server);
 
-io.on('connection', function (socket) {
+/* =========================
+   Configuration (ENV VARS)
+   ========================= */
 
-  socket.emit('message', { text : 'Welcome!' });
+const port = process.env.PORT || 4000;
 
-  socket.on('subscribe', function (data) {
+const pgHost = process.env.POSTGRES_HOST || 'postgres';
+const pgPort = parseInt(process.env.POSTGRES_PORT || '5432');
+const pgUser = process.env.POSTGRES_USER || 'postgres';
+const pgPassword = process.env.POSTGRES_PASSWORD || 'postgres';
+const pgDatabase = process.env.POSTGRES_DB || 'postgres';
+
+/* =========================
+   PostgreSQL Pool
+   ========================= */
+
+const pool = new Pool({
+  host: pgHost,
+  port: pgPort,
+  user: pgUser,
+  password: pgPassword,
+  database: pgDatabase,
+});
+
+/* =========================
+   Socket.IO
+   ========================= */
+
+io.on('connection', (socket) => {
+  socket.emit('message', { text: 'Welcome!' });
+
+  socket.on('subscribe', (data) => {
     socket.join(data.channel);
   });
 });
 
-var pool = new Pool({
-  connectionString: 'postgres://postgres:postgres@db/postgres'
-});
+/* =========================
+   DB bootstrap / retry
+   ========================= */
 
-async.retry(
-  {times: 1000, interval: 1000},
-  function(callback) {
-    pool.connect(function(err, client, done) {
-      if (err) {
-        console.error("Waiting for db");
-      }
-      callback(err, client);
-    });
-  },
-  function(err, client) {
-    if (err) {
-      return console.error("Giving up");
+async function waitForDb() {
+  while (true) {
+    try {
+      await pool.query('SELECT 1');
+      console.log('Connected to PostgreSQL');
+      break;
+    } catch (err) {
+      console.log('Waiting for PostgreSQL...');
+      await new Promise(r => setTimeout(r, 1000));
     }
-    console.log("Connected to db");
-    getVotes(client);
   }
-);
+}
 
-function getVotes(client) {
-  client.query('SELECT vote, COUNT(id) AS count FROM votes GROUP BY vote', [], function(err, result) {
-    if (err) {
-      console.error("Error performing query: " + err);
-    } else {
-      var votes = collectVotesFromResult(result);
-      io.sockets.emit("scores", JSON.stringify(votes));
-    }
+/* =========================
+   Votes polling
+   ========================= */
 
-    setTimeout(function() {getVotes(client) }, 1000);
-  });
+async function getVotes() {
+  try {
+    const result = await pool.query(
+      'SELECT vote, COUNT(id) AS count FROM votes GROUP BY vote'
+    );
+
+    const votes = collectVotesFromResult(result);
+    io.sockets.emit('scores', JSON.stringify(votes));
+  } catch (err) {
+    console.error('Error querying votes:', err.message);
+  } finally {
+    setTimeout(getVotes, 1000);
+  }
 }
 
 function collectVotesFromResult(result) {
-  var votes = {a: 0, b: 0};
+  const votes = { a: 0, b: 0 };
 
-  result.rows.forEach(function (row) {
-    votes[row.vote] = parseInt(row.count);
+  result.rows.forEach(row => {
+    votes[row.vote] = parseInt(row.count, 10);
   });
 
   return votes;
 }
 
+/* =========================
+   Express config
+   ========================= */
+
 app.use(cookieParser());
-app.use(express.urlencoded());
-app.use(express.static(__dirname + '/views'));
+app.use(express.urlencoded({ extended: true }));
+app.use(express.static(path.join(__dirname, 'views')));
 
-app.get('/', function (req, res) {
-  res.sendFile(path.resolve(__dirname + '/views/index.html'));
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'views', 'index.html'));
 });
 
-server.listen(port, function () {
-  var port = server.address().port;
-  console.log('App running on port ' + port);
-});
+/* =========================
+   Start server
+   ========================= */
+
+(async () => {
+  await waitForDb();
+  getVotes();
+
+  server.listen(port, () => {
+    console.log(`Result app listening on port ${port}`);
+  });
+})();
+
